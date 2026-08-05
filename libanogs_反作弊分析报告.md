@@ -3324,4 +3324,314 @@ grep -n "__fastcall \*\*)(" "libanogs(反vmp).so.c" | head -20
 
 ---
 
+## 33. 注入检测深度分析
+
+> **💡 新手解释**: 注入检测是反作弊最重要的功能之一。简单说就是检查有没有"不该出现的东西"跑到了程序的内存空间里。比如有外挂注入了自己的代码（Frida、Xposed等），或者修改了原有的代码（Hook）。反作弊通过多种方式来发现这些异常。
+
+### 33.1 注入检测总览
+
+ANOGS 使用 **6 种不同机制** 来检测注入:
+
+```
+注入检测总览
+│
+├── 1. 内存映射检测 (§33.2)
+│   ├── 扫描 /proc/self/maps 每一行
+│   ├── 检查权限: rwxp → 异常 (可写可执行)
+│   ├── 检查路径: 未知 .so → 异常
+│   └── 检查名称: 匹配特定库名
+│
+├── 2. ELF 段完整性检测 (§33.3)
+│   ├── 检查 .rela.plt → 是否被Hook
+│   ├── 检查 .rela.dyn → 是否被篡改
+│   ├── 检查 .rodata   → 是否被修改
+│   └── 检查 .dynstr   → 是否被替换
+│
+├── 3. inline hook 检测 (§33.4)
+│   ├── 检查函数开头指令是否被修改
+│   ├── 上报 "ms_set_inlie_hook" (case 10)
+│   └── 上报 "ms_hook_opcode" (case 11)
+│
+├── 4. 规则执行检测 (§33.5)
+│   ├── 检查规则是否被篡改
+│   ├── 上报 "ms_rule_exe_fail" (case 69)
+│   └── 上报 "ms_rule_op_is_change" (case 77)
+│
+├── 5. 数据匹配检测 (§33.6)
+│   ├── 检查单条数据是否匹配
+│   ├── 上报 "ms_single_match" (case 20)
+│   └── 上报 "ms_common_match" (case 21)
+│
+└── 6. 反调试检测 (§33.7)
+    ├── ptrace 检测
+    ├── 进程状态检测
+    └── 调试器检测
+```
+
+### 33.2 内存映射注入检测 (核心)
+
+> **💡 新手解释**: 这是最直接的注入检测方法。反作弊打开 `/proc/self/maps` 文件，逐行查看所有加载到内存中的文件。正常情况下，内存中的库应该是系统库（libc.so、libm.so等）和游戏自己的库。如果发现陌生的库（如 `frida-agent.so`、`libinject.so`），或者代码段有写权限（`rwxp` 而不是 `r-xp`），就说明被注入了。
+
+**函数**: `sub_373ED4` (地址: `0x373ED4`, 伪C行号: ~282000)
+
+```c
+// 注入检测核心逻辑 (简化版):
+__int64 __fastcall sub_373ED4(_BYTE *a1, __int64 *a2, unsigned int a3, __int64 a4, __int64 a5)
+{
+    // 1. 解密路径: "/proc/self/maps" 或 "/proc/%d/maps"
+    if (a3 & 0x80000000)  // PID = 0xFFFFFFFF → 检查自身
+        strcpy(path, "/proc/self/maps");  // 解密后
+    else
+        sprintf(path, "/proc/%d/maps", a3);  // 解密后
+    
+    // 2. 打开文件并逐行读取
+    fp = fopen(path, "r");
+    while (fgets(line, 1024, fp)) {
+        // 3. 检查是否匹配目标库 (a4 = 要搜索的库名)
+        if (strstr(line, a4)) {
+            // 4. 权限检查:
+            //    - 检查 "r-xp" (正常代码段)
+            //    - 检查 "r--p" (正常只读段)
+            //    - 检查 "r--s" (正常共享只读)
+            //    - 检查 "r-xs" (正常共享可执行)
+            //    - 检查 "[" (匿名映射, 如 [stack], [heap])
+            if (!*a1  // 首次匹配
+                || strstr(line, "[")  // 匿名映射
+                || strstr(line, "r-xp")  // 可执行代码段
+                || strstr(line, "r--p")  // 只读数据
+                || strstr(line, "r--s")  // 共享只读
+                || strstr(line, "r-xs"))  // 共享可执行
+            {
+                // 5. 调用 sub_373800 进一步处理
+                result = sub_373800(a1, line, a5, a4);
+                if (result) {
+                    *a2 = result;
+                    return 1;  // 找到匹配
+                }
+            }
+        }
+    }
+    fclose(fp);
+    
+    // 6. 如果没找到目标, 检查是否是自己
+    //    解密 "libanogs.so" 并比较
+    if (strstr(a4, "libanogs.so")) {
+        // 自己的库应该存在, 如果不存在说明被篡改
+        sub_373704(...);
+    }
+    return 0;
+}
+```
+
+**关键检测逻辑**:
+
+| 检测项 | 代码位置 | 说明 |
+|--------|---------|------|
+| PID 判断 | `0x373F68` | `a3 & 0x80000000` 决定读自身还是其他进程 |
+| 路径解密 | `0x373F98` | XOR 解密 `/proc/self/maps` (15字节) |
+| 路径解密 | `0x374074` | XOR 解密 `/proc/%d/maps` (13字节) |
+| 权限匹配 | `0x374124` | XOR 解密 `r-xp` (4字节) |
+| 权限匹配 | `0x374134` | XOR 解密 `r--p` (4字节) |
+| 行匹配 | `0x374194` | `sub_5201C0(v41, a4)` — 搜索库名 |
+| 匿名映射 | `0x3742CC` | `sub_5201C0(v41, "[")` — 匹配 `[stack]` 等 |
+| 自身检测 | `0x374374` | XOR 解密 `libanogs.so` (11字节) |
+
+**maps 文件格式示例**:
+```
+地址范围          权限  偏移    设备   inode  路径
+7f000000-7f001000 r-xp 00000000 08:01 123456 /system/lib/libc.so   ← 正常
+7f001000-7f002000 r--p 00001000 08:01 123456 /system/lib/libc.so   ← 正常
+7f002000-7f003000 rw-p 00002000 08:01 123456 /system/lib/libc.so   ← 正常
+7f123000-7f124000 rwxp 00000000 00:00 0      [anon:unknown]        ← 异常! 可写可执行
+7f234000-7f235000 r-xp 00000000 08:01 654321 /data/data/com.game/lib/frida-agent.so  ← 异常! 陌生库
+```
+
+### 33.3 ELF 段完整性检测 (注入检测)
+
+> **💡 新手解释**: 外挂注入后通常会修改程序的函数跳转表（GOT/PLT），让程序调用"正常函数"时实际上跑到"恶意函数"。反作弊通过检查 `.rela.plt` 和 `.rela.dyn` 这些段有没有被篡改来发现这种 Hook。
+
+**相关函数**: `sub_317954`, `sub_32893C`, `sub_375344`
+
+**检测流程**:
+```
+1. 解密 ELF 段名: ".rodata", ".rela.plt", ".rela.dyn", ".dynstr"
+2. 在内存中定位这些段
+3. 检查每段的预期权限:
+   - .rodata   → r--p (只读) 
+   - .rela.plt → r--p (只读)
+   - .rela.dyn → r--p (只读)
+   - .dynstr   → r--p (只读)
+4. 如果发现异常权限 → 上报
+5. 检查段的大小是否和预期一致
+6. 检查是否有额外的未知段
+```
+
+**注入检测特有的上报字段**:
+
+| Switch Case | 字段名 | 说明 |
+|------------|--------|------|
+| case 10 | `ms_set_inlie_hook` | 检测到 inline hook 设置 |
+| case 11 | `ms_hook_opcode` | 检测到 hook 操作码 |
+| case 44 | `ms_mmap` | 检测到异常 mmap 调用 |
+| case 59 | `ms_mod` | 检测到模块被修改 |
+| case 69 | `ms_rule_exe_fail` | 检测规则执行失败 |
+| case 77 | `ms_rule_op_is_change` | 检测规则被篡改 |
+| case 20 | `ms_single_match` | 单条数据匹配异常 |
+| case 21 | `ms_common_match` | 通用数据匹配异常 |
+
+### 33.4 inline hook 检测
+
+> **💡 新手解释**: Inline hook 是一种更隐蔽的注入方式。它不修改函数跳转表，而是直接修改函数开头的指令，把前几个字节改成跳转指令（跳到恶意代码）。反作弊检查关键函数的开头指令是否和预期一致。
+
+**相关字符串**:
+- `"inline_hook_opcode_dismatch"` (地址: `0xA014B`) — 操作码不匹配
+- `"set_inline_hook_error"` (地址: `0xA0949`) — 设置 hook 失败
+- `"ms_set_inlie_hook"` (地址: `0xA478D`) — 上报字段名
+- `"ms_hook_opcode"` (地址: `0xA6299`) — 上报字段名
+
+**检测逻辑** (79路Switch case 10 和 11):
+```c
+case 10:  // ms_set_inlie_hook
+    if (*a1 >= 6 && (byte_54ABC3 & 1)) {
+        byte_54ABC3 = 0;
+        // 格式化: "%s;pointID:%s"
+        sprintf(buf, "%s;pointID:%s", ...);
+        sub_379220(a1, "ms_set_inlie_hook", buf);
+    }
+    break;
+
+case 11:  // ms_hook_opcode
+    if (*a1 >= 6 && (byte_54ABC4 & 1)) {
+        byte_54ABC4 = 0;
+        // 格式化: "%s;pointID:%s"
+        sprintf(buf, "%s;pointID:%s", ...);
+        sub_379220(a1, "ms_hook_opcode", buf);
+    }
+    break;
+```
+
+### 33.5 规则执行检测
+
+> **💡 新手解释**: 反作弊有一些"检测规则"（比如"检查某块内存是否有写权限"）。如果这些规则本身被篡改了，或者执行过程中发现异常，就会触发规则执行检测。
+
+**相关字符串**:
+- `"ms_rule_exe_fail"` (地址: `0xA0529`) — 规则执行失败
+- `"ms_rule_op_is_change"` (地址: `0xA01C2`) — 规则被篡改
+
+**检测逻辑** (79路Switch case 69 和 77):
+```c
+case 69:  // ms_rule_exe_fail
+    if (*a1 >= 2 && (byte_54ABD2 & 1)) {
+        byte_54ABD2 = 0;
+        // 格式化: "%s;pID:%s;rID:%s"
+        sprintf(buf, "%s;pID:%s;rID:%s", ...);
+        sub_379220(a1, "ms_rule_exe_fail", buf);
+    }
+    break;
+
+case 77:  // ms_rule_op_is_change
+    if (*a1 >= 2 && (byte_54ABD3 & 1)) {
+        byte_54ABD3 = 0;
+        // 格式化: "%s;pID:%s;rID:%s"
+        sprintf(buf, "%s;pID:%s;rID:%s", ...);
+        sub_379220(a1, "ms_rule_op_is_change", buf);
+    }
+    break;
+```
+
+### 33.6 数据匹配检测
+
+> **💡 新手解释**: 反作弊维护了一个"预期数据"的列表（hash_cache）。如果实际检测到的数据和预期的不匹配，就说明数据被篡改了。这就像"对账本"——账本上的数字对不上，肯定有人动过手脚。
+
+**相关字符串**:
+- `"ms_single_match"` (地址: `0xA4340`) — 单条数据不匹配
+- `"ms_common_match"` (地址: `0xA183F`) — 通用数据不匹配
+- `"mrpcs_single_data_not_match!"` (地址: `0xA050C`) — 错误描述
+- `"mrpcs_common_data_not_match!"` (地址: `0xA379E`) — 错误描述
+
+### 33.7 反调试检测
+
+> **💡 新手解释**: 外挂作者经常用调试器来分析游戏，所以反作弊会检测是否有调试器附加到进程上。ptrace 是一个系统调用，可以用来监视另一个进程——如果一个进程已经被调试器 ptrace 了，就不能再被第二次 ptrace，反作弊通过尝试 ptrace 自己来检测是否被调试。
+
+**检测方法**:
+1. **ptrace 检测**: 尝试 `ptrace(PTRACE_TRACEME)`，如果失败说明已被调试
+2. **/proc/self/status 检测**: 读取 `TracerPid` 字段，非 0 说明被调试
+3. **/proc/self/cmdline 检测**: 检查命令行参数是否异常
+4. **线程状态检测**: 检查是否有异常线程在运行
+
+**相关导入**:
+- `ptrace` (地址: `0x27BA`)
+- `popen` (地址: `0x2710`) — 用于执行 shell 命令检测
+
+### 33.8 注入检测函数地址总表
+
+| 函数 | 地址 | 大小 | 伪C行号 | 作用 |
+|------|------|------|---------|------|
+| `sub_373ED4` | `0x373ED4` | 0x614 | ~282000 | **maps读取 + 库名匹配 + 权限检查** |
+| `sub_3745E8` | `0x3745E8` | 0xD5C | ~282100 | **maps解析器 (逐行解析)** |
+| `sub_373800` | `0x373800` | 0x6D4 | ~281900 | maps行处理器 (匹配结果处理) |
+| `sub_3744E8` | `0x3744E8` | 0x100 | ~282080 | 路径格式化 |
+| `sub_375344` | `0x375344` | 0x5F8 | ~282600 | **ELF段检测 (GOT/PLT Hook)** |
+| `sub_317954` | `0x317954` | 0xC3C | ~240000 | **批量ELF段检测 (14段)** |
+| `sub_32893C` | `0x32893C` | 0xBA4 | ~250000 | **批量ELF段检测 (扩展)** |
+| `sub_37E580` | `0x37E580` | 0x9B0 | ~283500 | 内存段扫描 |
+| `sub_37E328` | `0x37E328` | 0x258 | ~283400 | 路径匹配器 |
+| `sub_37DF9C` | `0x37DF9C` | 0x38C | ~283300 | ELF段名匹配器 |
+| `sub_377764` | `0x377764` | 0x3E0 | ~283200 | 通用内存检测 |
+| `sub_37966C` | `0x37966C` | 0x14FC | 282892 | **79路Switch (分类上报)** |
+| `sub_3794CC` | `0x3794CC` | 0x17C | 282851 | 模块错误上报 (ms_curr_mod) |
+| `sub_2F4F04` | `0x2F4F04` | 0x150 | 217986 | **消息分发器 (上游)** |
+
+### 33.9 注入检测标识符速查
+
+| 关键字 | 地址 | 类型 | 含义 |
+|--------|------|------|------|
+| `"ms_set_inlie_hook"` | `0xA478D` | 字符串 | inline hook 设置检测 |
+| `"ms_hook_opcode"` | `0xA6299` | 字符串 | hook 操作码检测 |
+| `"ms_mmap"` | `0xA37BB` | 字符串 | mmap 异常检测 |
+| `"ms_mod"` | `0xA2FC5` | 字符串 | 模块修改检测 |
+| `"ms_curr_mod"` | `0xA4323` | 字符串 | 当前模块错误 |
+| `"ms_mode_path"` | `0xA6677` | 字符串 | 模块路径异常 |
+| `"ms_rule_exe_fail"` | `0xA0529` | 字符串 | 规则执行失败 |
+| `"ms_rule_op_is_change"` | `0xA01C2` | 字符串 | 规则被篡改 |
+| `"ms_single_match"` | `0xA4340` | 字符串 | 单数据不匹配 |
+| `"ms_common_match"` | `0xA183F` | 字符串 | 通用数据不匹配 |
+| `"inline_hook_opcode_dismatch"` | `0xA014B` | 字符串 | inline hook 操作码不匹配 |
+| `"set_inline_hook_error"` | `0xA0949` | 字符串 | inline hook 设置错误 |
+| `byte_54ABC3` | `0x54ABC3` | char | inline hook 标志 (case 10) |
+| `byte_54ABC4` | `0x54ABC4` | char | hook opcode 标志 (case 11) |
+| `byte_54ABCD` | `0x54ABCD` | char | mmap 错误标志 (case 44) |
+| `byte_54ABD1` | `0x54ABD1` | char | 模块错误标志 (case 59) |
+| `byte_54ABD2` | `0x54ABD2` | char | 规则执行失败标志 (case 69) |
+| `byte_54ABD3` | `0x54ABD3` | char | 规则被篡改标志 (case 77) |
+| `byte_54ABCA` | `0x54ABCA` | char | 单数据匹配标志 (case 20) |
+| `byte_54ABCB` | `0x54ABCB` | char | 通用数据匹配标志 (case 21) |
+
+### 33.10 注入检测在伪C文件中的搜索
+
+```bash
+# 搜索 inline hook 检测
+grep -n "ms_set_inlie_hook\|ms_hook_opcode\|inline_hook" "libanogs(反vmp).so.c"
+
+# 搜索模块检测
+grep -n "ms_mod\|ms_curr_mod\|ms_mode_path\|ms_mmap" "libanogs(反vmp).so.c"
+
+# 搜索规则检测
+grep -n "ms_rule_exe_fail\|ms_rule_op_is_change" "libanogs(反vmp).so.c"
+
+# 搜索数据匹配检测
+grep -n "ms_single_match\|ms_common_match" "libanogs(反vmp).so.c"
+
+# 搜索 maps 注入检测
+grep -n "sub_373ED4\|sub_3745E8\|sub_373800" "libanogs(反vmp).so.c" | grep -v "function\|__int64\|__fastcall"
+
+# 搜索权限检查
+grep -n "r-xp\|r--p\|r--s\|r-xs" "libanogs(反vmp).so.c" | head -20
+
+# 搜索 ptrace 检测
+grep -n "ptrace" "libanogs(反vmp).so.c"
+```
+
+---
+
 > **免责声明**: 本文档仅供安全研究与学习使用。所有分析基于已脱壳的二进制文件，不涉及对任何在线服务或产品的攻击。
